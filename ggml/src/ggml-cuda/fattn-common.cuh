@@ -288,6 +288,40 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
     return sum;
 }
 
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tq3_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const block_tq3_0 * K_tq3_0 = (const block_tq3_0 *) K_c;
+    GGML_UNUSED(Q_v);
+    // int8 centroids: {-127, -38, 38, 127} scaled from {-1.510, -0.4528, 0.4528, 1.510}
+    // scale = 1.510/127 so that centroid[i] = int8_c[i] * scale
+    static constexpr int8_t int8_centroids[4] = {-127, -38, 38, 127};
+    static constexpr float centroid_scale = 0.01188976377952756f; // 1.510/127
+    float sum = 0.0f;
+    const float2 * Q_ds = (const float2 *) Q_ds_v;
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int ib  = k_KQ / QI8_0;
+        const int iqs = k_KQ % QI8_0;
+        // Pack 4 centroid int8 values into one int (same layout as q8_0 qs)
+        int v = 0;
+        int8_t * vb = (int8_t *) &v;
+#pragma unroll
+        for (int l = 0; l < 4; l++) {
+            const int j  = iqs * 4 + l;
+            const int qi = (K_tq3_0[ib].qs[j/4] >> (2*(j%4))) & 0x3;
+            vb[l] = int8_centroids[qi];
+        }
+        // K effective scale = gamma * centroid_scale
+        // Use same dp4a path as q8_0
+        const float K_d = __half2float(K_tq3_0[ib].gamma) * centroid_scale;
+        const float Q_d = Q_ds[k_KQ_0/nthreads].x;
+        sum += vec_dot_q8_0_q8_1_impl<float, 1>(&v, &Q_q8[k_KQ_0/nthreads], K_d, Q_d);
+    }
+    return sum;
+}
+
 template <typename Tds, int ni>
 static __device__ __forceinline__ void quantize_q8_1_to_shared(
     const float * __restrict__ x, const float scale, int * __restrict__ yq32, void * __restrict__ yds) {
@@ -577,6 +611,107 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tq3_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_tq3_0 * x = (const block_tq3_0 *) vx;
+    static constexpr float centroids[4] = {-1.510f, -0.4528f, 0.4528f, 1.510f};
+    static constexpr int8_t tq3_signs[32] = {
+        +1, -1, +1, +1, -1, -1, +1, -1, +1, +1, -1, +1, -1, +1, -1, -1,
+        +1, -1, -1, +1, +1, -1, +1, -1, -1, +1, +1, +1, -1, -1, +1, -1
+    };
+    static constexpr float inv_sqrt32 = 0.17677669529663688f;
+
+    // i0 is element index, find block and position
+    const int64_t ib  = i0 / QK_TQ3_0;
+    const int     iqs = i0 % QK_TQ3_0;
+    const float d = __half2float(x[ib].gamma);
+
+    // Dequantize full block to rotated space
+    float rotated[QK_TQ3_0];
+#pragma unroll
+    for (int j = 0; j < QK_TQ3_0; j++) {
+        const int qi = (x[ib].qs[j/4] >> (2*(j%4))) & 0x3;
+        rotated[j] = d * centroids[qi];
+    }
+    // Inverse WHT butterfly
+#pragma unroll
+    for (int step = 1; step < QK_TQ3_0; step <<= 1) {
+#pragma unroll
+        for (int i = 0; i < QK_TQ3_0; i += step*2) {
+#pragma unroll
+            for (int j = i; j < i+step; j++) {
+                float a = rotated[j], b = rotated[j+step];
+                rotated[j]       = a + b;
+                rotated[j+step]  = a - b;
+            }
+        }
+    }
+    // Normalize and undo sign flips
+#pragma unroll
+    for (int j = 0; j < QK_TQ3_0; j++) {
+        rotated[j] *= inv_sqrt32 * tq3_signs[j];
+    }
+    // Output ne values starting at iqs
+    static_assert(ne % 2 == 0, "bad ne");
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same<T, half>::value) {
+#pragma unroll
+        for (int l = 0; l < ne; l += 2) {
+            ((half2 *) dst)[l/2] = make_half2(rotated[iqs+l], rotated[iqs+l+1]);
+        }
+    } else
+#endif
+    if constexpr (std::is_same<T, float>::value) {
+#pragma unroll
+        for (int l = 0; l < ne; l++) {
+            ((float *) dst)[l] = rotated[iqs + l];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tq3_0v(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_tq3_0v * x = (const block_tq3_0v *) vx;
+    // TQ3_0V stored in original space — just centroid lookup, no WHT needed!
+    // Centroids: {-1.510, -0.4528, 0.4528, 1.510} scaled by gamma
+    static constexpr float centroids[4] = {-1.510f, -0.4528f, 0.4528f, 1.510f};
+
+    // i0 is element index — same pattern as dequantize_V_q8_0
+    const int64_t ib  = i0 / QK_TQ3_0V;
+    const int     iqs = i0 % QK_TQ3_0V;
+    const float d = __half2float(x[ib].gamma);
+
+    static_assert(ne % 2 == 0, "bad ne");
+    // Unpack ne 2-bit indices starting at iqs
+    // tq3_0v qs layout: 4 values per byte (2 bits each)
+    // byte index = j/4, bit offset = 2*(j%4)
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same<T, half>::value) {
+        const half2 dh = __float2half2_rn(d);
+#pragma unroll
+        for (int l = 0; l < ne; l += 2) {
+            const int j0 = iqs + l;
+            const int j1 = iqs + l + 1;
+            const int qi0 = (x[ib].qs[j0/4] >> (2*(j0%4))) & 0x3;
+            const int qi1 = (x[ib].qs[j1/4] >> (2*(j1%4))) & 0x3;
+            ((half2 *) dst)[l/2] = dh * make_half2(centroids[qi0], centroids[qi1]);
+        }
+    } else
+#endif
+    if constexpr (std::is_same<T, float>::value) {
+#pragma unroll
+        for (int l = 0; l < ne; l++) {
+            const int j  = iqs + l;
+            const int qi = (x[ib].qs[j/4] >> (2*(j%4))) & 0x3;
+            ((float *) dst)[l] = d * centroids[qi];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -593,6 +728,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TQ3_0) {
+        return vec_dot_fattn_vec_KQ_tq3_0<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -615,6 +752,10 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TQ3_0) {
+        return dequantize_V_tq3_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TQ3_0V) {
+        return dequantize_V_tq3_0v<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

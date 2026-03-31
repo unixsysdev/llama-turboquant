@@ -2489,6 +2489,52 @@ void dequantize_row_tq3_0(const block_tq3_0 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+// TQ3_0V: same as TQ3_0 but stored in ORIGINAL space (no WHT)
+// V-cache variant: dequant is just centroid lookup, no WHT inverse needed
+void quantize_row_tq3_0v_ref(const float * GGML_RESTRICT x, block_tq3_0v * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ3_0V == 0);
+    const int64_t nb = k / QK_TQ3_0V;
+    const float centroids[4] = { -1.510f, -0.4528f, 0.4528f, 1.510f };
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float * xb = x + i * QK_TQ3_0V;
+        memset(&y[i], 0, sizeof(block_tq3_0v));
+
+        float amax = 0.0f;
+        for (int j = 0; j < QK_TQ3_0V; j++) {
+            float av = fabsf(xb[j]);
+            if (av > amax) amax = av;
+        }
+        const float d = amax / 1.510f;
+        const float id = d > 0.0f ? 1.0f / d : 0.0f;
+        y[i].gamma = GGML_FP32_TO_FP16(d);
+
+        for (int j = 0; j < QK_TQ3_0V; j++) {
+            float xn = xb[j] * id;
+            int idx;
+            if (xn < 0.0f) { idx = (xn < -0.9814f) ? 0 : 1; }
+            else            { idx = (xn <  0.9814f) ? 2 : 3; }
+            y[i].qs[j / 4] |= (idx << (2 * (j % 4)));
+            float residual = xb[j] - d * centroids[idx];
+            if (residual >= 0.0f) { y[i].qr[j / 8] |= (1 << (j % 8)); }
+        }
+    }
+}
+
+void dequantize_row_tq3_0v(const block_tq3_0v * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ3_0V == 0);
+    const int64_t nb = k / QK_TQ3_0V;
+    const float centroids[4] = { -1.510f, -0.4528f, 0.4528f, 1.510f };
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = GGML_FP16_TO_FP32(x[i].gamma);
+        for (int j = 0; j < QK_TQ3_0V; j++) {
+            const int idx = (x[i].qs[j / 4] >> (2 * (j % 4))) & 3;
+            y[i * QK_TQ3_0V + j] = d * centroids[idx];
+        }
+    }
+}
+
 size_t quantize_tq3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     (void)quant_weights; // not used
     const size_t row_size = ggml_row_size(GGML_TYPE_TQ3_0, n_per_row);

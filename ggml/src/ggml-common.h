@@ -280,6 +280,9 @@ typedef struct {
     ggml_half gamma;             // ||residual||₂ for QJL correction scaling
 } block_tq3_0;
 static_assert(sizeof(block_tq3_0) == QK_TQ3_0/4 + QK_TQ3_0/8 + sizeof(ggml_half), "wrong tq3_0 block size/padding");
+// TQ3_0V reuses exact same block layout — only difference is no WHT at quantize/dequantize
+typedef block_tq3_0 block_tq3_0v;
+#define QK_TQ3_0V QK_TQ3_0
 
 //
 // Super-block quantization structures

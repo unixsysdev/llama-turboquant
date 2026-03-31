@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-mma-tq3_0.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
@@ -265,7 +266,6 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_Q8_0)
-
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_BF16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_BF16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1, GGML_TYPE_BF16)
@@ -279,6 +279,11 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 #endif // GGML_CUDA_FA_ALL_QUANTS
+    // TQ3_0 is always available regardless of FA_ALL_QUANTS
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQ3_0, GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQ3_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQ3_0, GGML_TYPE_TQ3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQ3_0, GGML_TYPE_TQ3_0V)
 
     GGML_ABORT("fatal error");
 }
@@ -289,7 +294,8 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE     = 200,
     BEST_FATTN_KERNEL_VEC      = 100,
     BEST_FATTN_KERNEL_WMMA_F16 = 300,
-    BEST_FATTN_KERNEL_MMA_F16  = 400,
+    BEST_FATTN_KERNEL_MMA_F16   = 400,
+    BEST_FATTN_KERNEL_MMA_TQ3_0 = 500,
 };
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
@@ -354,7 +360,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
     if (K->type != V->type) {
-        return BEST_FATTN_KERNEL_NONE;
+        // tq3_0 K-cache explicitly supports q8_0 and f16 V-cache
+        const bool tq3_0_ok = K->type == GGML_TYPE_TQ3_0 &&
+            (V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_F16 ||
+             V->type == GGML_TYPE_TQ3_0 || V->type == GGML_TYPE_TQ3_0V);
+        if (!tq3_0_ok) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
@@ -371,6 +383,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
+        case GGML_TYPE_TQ3_0:
             break;
         default:
             return BEST_FATTN_KERNEL_NONE;
@@ -385,6 +398,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        // TQ3_0: use MMA kernel for D=128,256
+        if (K->type == GGML_TYPE_TQ3_0) {
+            if (Q->ne[0] == 128 || Q->ne[0] == 256) {
+                return BEST_FATTN_KERNEL_MMA_TQ3_0;
+            }
+            if (can_use_vector_kernel) {
+                return BEST_FATTN_KERNEL_MMA_TQ3_0;
+            }
+            return BEST_FATTN_KERNEL_NONE;
+        }
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 && !(gqa_ratio > 4 && K->ne[1] >= 8192)) {
@@ -485,6 +508,25 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
+static void ggml_cuda_flash_attn_ext_mma_tq3_0(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q  = dst->src[0];
+    const int ne01 = Q->ne[1];
+    const int DKQ  = Q->ne[0];
+    if (DKQ == 128) {
+        if      (ne01 >= 64) ggml_cuda_flash_attn_ext_mma_tq3_0_case<128, 128, 64, 1>(ctx, dst);
+        else if (ne01 >= 32) ggml_cuda_flash_attn_ext_mma_tq3_0_case<128, 128, 32, 1>(ctx, dst);
+        else if (ne01 >= 16) ggml_cuda_flash_attn_ext_mma_tq3_0_case<128, 128, 16, 1>(ctx, dst);
+        else                 ggml_cuda_flash_attn_ext_mma_tq3_0_case<128, 128,  8, 1>(ctx, dst);
+    } else if (DKQ == 256) {
+        if      (ne01 >= 64) ggml_cuda_flash_attn_ext_mma_tq3_0_case<256, 256, 64, 1>(ctx, dst);
+        else if (ne01 >= 32) ggml_cuda_flash_attn_ext_mma_tq3_0_case<256, 256, 32, 1>(ctx, dst);
+        else if (ne01 >= 16) ggml_cuda_flash_attn_ext_mma_tq3_0_case<256, 256, 16, 1>(ctx, dst);
+        else                 ggml_cuda_flash_attn_ext_mma_tq3_0_case<256, 256,  8, 1>(ctx, dst);
+    } else {
+        GGML_ABORT("tq3_0 MMA: unsupported D=%d", DKQ);
+    }
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
@@ -501,6 +543,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_MMA_TQ3_0:
+            ggml_cuda_flash_attn_ext_mma_tq3_0(ctx, dst);
             break;
     }
 }

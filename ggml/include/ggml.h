@@ -429,7 +429,8 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_TQ3_0   = 41, // TurboQuant 3-bit polar + QJL (no per-block scale)
-        GGML_TYPE_COUNT   = 42,
+        GGML_TYPE_TQ3_0V  = 42, // TQ3_0 V-cache: same layout, stored in original space (no WHT)
+        GGML_TYPE_COUNT   = 43,
     };
 
     // precision

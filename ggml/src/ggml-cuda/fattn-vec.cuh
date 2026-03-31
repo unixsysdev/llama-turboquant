@@ -165,10 +165,54 @@ static __global__ void flash_attn_ext_vec(
             } else {
                 const float * Q_f = (const float *) (Q + j*nb01);
                 constexpr int nthreads_quantize = D/sizeof(int) < WARP_SIZE ? D/sizeof(int) : WARP_SIZE;
+                if constexpr (type_K == GGML_TYPE_TQ3_0) {
+                    // Pre-rotate Q with WHT forward transform so vec_dot can work
+                    // directly in rotated space: <WHT(Q), stored_K> = <Q, WHT^{-1}(stored_K)>
+                    // This avoids WHT inverse in the hot dot product path.
+                    static constexpr int8_t tq3_signs[32] = {
+                        +1, -1, +1, +1, -1, -1, +1, -1, +1, +1, -1, +1, -1, +1, -1, -1,
+                        +1, -1, -1, +1, +1, -1, +1, -1, -1, +1, +1, +1, -1, -1, +1, -1
+                    };
+                    static constexpr float inv_sqrt32 = 0.17677669529663688f;
+                    // Copy Q to local, apply WHT forward per block of 32
+                    float Q_rot[D];
 #pragma unroll
-                for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += nthreads_quantize) {
-                    quantize_q8_1_to_shared<float2, nthreads_quantize>
-                        (Q_f + i0*sizeof(int), scale, tmp_q_i32 + i0, tmp_q_ds + i0/QI8_1);
+                    for (int i = 0; i < D; i++) {
+                        Q_rot[i] = Q_f[i] * tq3_signs[i % 32];
+                    }
+                    // WHT butterfly stages per block of 32
+#pragma unroll
+                    for (int b = 0; b < D/32; b++) {
+                        float * xb = Q_rot + b*32;
+#pragma unroll
+                        for (int step = 1; step < 32; step <<= 1) {
+#pragma unroll
+                            for (int i = 0; i < 32; i += step*2) {
+#pragma unroll
+                                for (int jj = i; jj < i+step; jj++) {
+                                    float a = xb[jj], bv = xb[jj+step];
+                                    xb[jj]        = a + bv;
+                                    xb[jj+step]   = a - bv;
+                                }
+                            }
+                        }
+                        // Normalize once after all butterfly stages
+#pragma unroll
+                        for (int i = 0; i < 32; i++) {
+                            xb[i] *= inv_sqrt32;
+                        }
+                    }
+#pragma unroll
+                    for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += nthreads_quantize) {
+                        quantize_q8_1_to_shared<float2, nthreads_quantize>
+                            (Q_rot + i0*sizeof(int), scale, tmp_q_i32 + i0, tmp_q_ds + i0/QI8_1);
+                    }
+                } else {
+#pragma unroll
+                    for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += nthreads_quantize) {
+                        quantize_q8_1_to_shared<float2, nthreads_quantize>
+                            (Q_f + i0*sizeof(int), scale, tmp_q_i32 + i0, tmp_q_ds + i0/QI8_1);
+                    }
                 }
             }
         }

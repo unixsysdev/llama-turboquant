@@ -284,6 +284,34 @@ static __device__ void cpy_blck_f32_tq3_0(const char * cxi, char * cdsti) {
     quantize_f32_tq3_0_block((const float *)cxi, (block_tq3_0 *)cdsti);
 }
 
+// TQ3_0V: quantize WITHOUT WHT - store in original space for V-cache
+// dequant is just centroid lookup, no inverse WHT needed
+__device__ static constexpr float tq3_0v_centroids[4] = {-1.510f, -0.4528f, 0.4528f, 1.510f};
+static __device__ void quantize_f32_tq3_0v_block(const float * __restrict__ x, block_tq3_0v * __restrict__ y) {
+    memset(y, 0, sizeof(block_tq3_0v));
+    float amax = 0.0f;
+    for (int j = 0; j < QK_TQ3_0; j++) {
+        float av = fabsf(x[j]);
+        if (av > amax) amax = av;
+    }
+    const float d = amax / 1.510f;
+    const float id = d > 0.0f ? 1.0f / d : 0.0f;
+    y->gamma = __float2half(d);
+    for (int j = 0; j < QK_TQ3_0; j++) {
+        float xn = x[j] * id;
+        int idx;
+        if (xn < 0.0f) { idx = (xn < -0.9814f) ? 0 : 1; }
+        else            { idx = (xn <  0.9814f) ? 2 : 3; }
+        y->qs[j / 4] |= (idx << (2 * (j % 4)));
+        float residual = x[j] - d * tq3_0v_centroids[idx];
+        if (residual >= 0.0f) { y->qr[j / 8] |= (1 << (j % 8)); }
+    }
+}
+
+static __device__ void cpy_blck_f32_tq3_0v(const char * cxi, char * cdsti) {
+    quantize_f32_tq3_0v_block((const float *)cxi, (block_tq3_0v *)cdsti);
+}
+
 template<typename src_t, typename dst_t>
 static __device__ void cpy_1_scalar(const char * cxi, char * cdsti) {
     *(dst_t *) cdsti = ggml_cuda_cast<dst_t>(*(const src_t *) cxi);

@@ -2953,11 +2953,8 @@ llama_context * llama_init_from_model(
         }
     }
 
-    // TQ3_0 K cache has no flash attention kernel support - force off
-    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && params.type_k == GGML_TYPE_TQ3_0) {
-        LLAMA_LOG_WARN("%s: flash_attn is not supported with TQ3_0 K cache - forcing off\n", __func__);
-        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
-    }
+    // TQ3_0 K cache now has flash attention kernel support via vec_dot_fattn_vec_KQ_tq3_0
+    // TQ3_0V V cache stores in original space - compatible with FA
 
     if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(params.type_v)) {
         const uint32_t blck_size = ggml_blck_size(params.type_v);
