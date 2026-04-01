@@ -281,6 +281,24 @@ typedef struct {
 } block_tq3_0;
 static_assert(sizeof(block_tq3_0) == QK_TQ3_0/4 + QK_TQ3_0/8 + sizeof(ggml_half), "wrong tq3_0 block size/padding");
 
+// PrismML Q1_0: 1-bit ternary quantization (32-element blocks)
+// Each value quantized as sign bit: bit=1 → +scale, bit=0 → −scale
+// scale = mean(abs(values)) per block
+#define QK1_0 32
+typedef struct {
+    ggml_half d;         // scale (mean absolute value)
+    uint8_t   qs[QK1_0 / 8]; // sign bits: 32 × 1 bit = 4 bytes
+} block_q1_0;
+static_assert(sizeof(block_q1_0) == sizeof(ggml_half) + QK1_0/8, "wrong q1_0 block size/padding");
+
+// PrismML Q1_0_G128: 1-bit ternary quantization (128-element blocks)
+#define QK1_0_G128 128
+typedef struct {
+    ggml_half d;                   // scale
+    uint8_t   qs[QK1_0_G128 / 8]; // sign bits: 128 × 1 bit = 16 bytes
+} block_q1_0_g128;
+static_assert(sizeof(block_q1_0_g128) == sizeof(ggml_half) + QK1_0_G128/8, "wrong q1_0_g128 block size/padding");
+
 //
 // Super-block quantization structures
 //

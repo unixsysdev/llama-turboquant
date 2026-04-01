@@ -2496,6 +2496,92 @@ size_t quantize_tq3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     return nrow * row_size;
 }
 
+// ====================== PrismML Q1_0 1-bit ternary quantization ======================
+
+void quantize_row_q1_0_ref(const float * GGML_RESTRICT x, block_q1_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK1_0 == 0);
+    const int64_t nb = k / QK1_0;
+
+    for (int64_t i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < QK1_0; j++) {
+            amax += fabsf(x[i * QK1_0 + j]);
+        }
+        const float d = amax / QK1_0;
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        for (int j = 0; j < QK1_0; j++) {
+            if (x[i * QK1_0 + j] >= 0.0f) {
+                y[i].qs[j / 8] |= (1 << (j % 8));
+            }
+        }
+    }
+}
+
+void dequantize_row_q1_0(const block_q1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK1_0 == 0);
+    const int64_t nb = k / QK1_0;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < QK1_0; j++) {
+            const int bit = (x[i].qs[j / 8] >> (j % 8)) & 1;
+            y[i * QK1_0 + j] = bit ? d : -d;
+        }
+    }
+}
+
+size_t quantize_q1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q1_0, n_per_row);
+    quantize_row_q1_0_ref(src, dst, (int64_t)nrow * n_per_row);
+    return nrow * row_size;
+}
+
+// ====================== PrismML Q1_0_G128 1-bit ternary (128-element blocks) ======================
+
+void quantize_row_q1_0_g128_ref(const float * GGML_RESTRICT x, block_q1_0_g128 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK1_0_G128 == 0);
+    const int64_t nb = k / QK1_0_G128;
+
+    for (int64_t i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < QK1_0_G128; j++) {
+            amax += fabsf(x[i * QK1_0_G128 + j]);
+        }
+        const float d = amax / QK1_0_G128;
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        for (int j = 0; j < QK1_0_G128; j++) {
+            if (x[i * QK1_0_G128 + j] >= 0.0f) {
+                y[i].qs[j / 8] |= (1 << (j % 8));
+            }
+        }
+    }
+}
+
+void dequantize_row_q1_0_g128(const block_q1_0_g128 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK1_0_G128 == 0);
+    const int64_t nb = k / QK1_0_G128;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < QK1_0_G128; j++) {
+            const int bit = (x[i].qs[j / 8] >> (j % 8)) & 1;
+            y[i * QK1_0_G128 + j] = bit ? d : -d;
+        }
+    }
+}
+
+size_t quantize_q1_0_g128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q1_0_G128, n_per_row);
+    quantize_row_q1_0_g128_ref(src, dst, (int64_t)nrow * n_per_row);
+    return nrow * row_size;
+}
+
 // ====================== "True" 2-bit (de)-quantization
 
 void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {

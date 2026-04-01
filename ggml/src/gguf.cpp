@@ -568,6 +568,24 @@ struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_para
     }
 
     // read the tensor info
+    // PrismML Q1_0 compatibility: detect if this GGUF uses PrismML type IDs
+    // PrismML encodes Q1_0 as type 40 and Q1_0_g128 as type 41, which clash
+    // with NVFP4 (40) and TQ3_0 (41). Detect via general.file_type KV:
+    //   ftype 40 = MOSTLY_Q1_0, ftype 41 = MOSTLY_Q1_0_g128 (PrismML)
+    //   ftype 26 = MOSTLY_NVFP4 (this fork)
+    bool remap_prismml = false;
+    {
+        const int64_t ft_idx = gguf_find_key(ctx, "general.file_type");
+        if (ft_idx >= 0) {
+            const uint32_t ftype = gguf_get_val_u32(ctx, ft_idx);
+            // PrismML uses ftype values 40 or 41 for Q1_0 models
+            if (ftype == 40 || ftype == 41) {
+                GGML_LOG_INFO("%s: detected PrismML Q1_0 file (file_type=%u), remapping type IDs\n", __func__, ftype);
+                remap_prismml = true;
+            }
+        }
+    }
+
     for (int64_t i = 0; ok && i < n_tensors; ++i) {
         struct gguf_tensor_info info;
 
@@ -647,6 +665,15 @@ struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_para
         // tensor type
         {
             ok = ok && gr.read(info.t.type);
+
+            // PrismML Q1_0 compatibility remap
+            if (remap_prismml) {
+                if (info.t.type == (enum ggml_type)40) {
+                    info.t.type = GGML_TYPE_Q1_0;
+                } else if (info.t.type == (enum ggml_type)41) {
+                    info.t.type = GGML_TYPE_Q1_0_G128;
+                }
+            }
 
             // check that tensor type is within defined range
             if (info.t.type < 0 || info.t.type >= GGML_TYPE_COUNT) {

@@ -114,6 +114,83 @@ void quantize_row_tq3_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, 
     quantize_row_tq3_0_ref(x, y, k);
 }
 
+void quantize_row_q1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK1_0 == 0);
+    block_q1_0 * GGML_RESTRICT y = vy;
+    quantize_row_q1_0_ref(x, y, k);
+}
+
+void quantize_row_q1_0_g128(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK1_0_G128 == 0);
+    block_q1_0_g128 * GGML_RESTRICT y = vy;
+    quantize_row_q1_0_g128_ref(x, y, k);
+}
+
+//===================================== Q1_0 vec_dot =================================
+
+void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK8_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+
+    const block_q1_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_FP16_TO_FP32(x[i].d);
+        const float d1 = GGML_FP16_TO_FP32(y[i].d);
+
+        int sumi = 0;
+        for (int j = 0; j < QK1_0; j++) {
+            const int xi = ((x[i].qs[j / 8] >> (j % 8)) & 1) ? 1 : -1;
+            sumi += xi * (int)y[i].qs[j];
+        }
+
+        sumf += d0 * d1 * (float)sumi;
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_q1_0_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK1_0_G128;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+
+    const block_q1_0_g128 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_FP16_TO_FP32(x[i].d);
+
+        // Each Q1_0_g128 block spans 4 Q8_0 blocks (4 × 32 = 128)
+        for (int k = 0; k < 4; k++) {
+            const float d1 = GGML_FP16_TO_FP32(y[i * 4 + k].d);
+            int sumi = 0;
+
+            for (int j = 0; j < QK8_0; j++) {
+                const int bit_index = k * QK8_0 + j;
+                const int xi = ((x[i].qs[bit_index / 8] >> (bit_index % 8)) & 1) ? 1 : -1;
+                sumi += xi * (int)y[i * 4 + k].qs[j];
+            }
+
+            sumf += d0 * d1 * (float)sumi;
+        }
+    }
+
+    *s = sumf;
+}
+
 //===================================== Q8_K ==============================================
 
 void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
