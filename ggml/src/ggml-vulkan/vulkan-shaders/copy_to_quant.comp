@@ -246,6 +246,63 @@ void quantize(uint dst_idx, uint src_idx)
 }
 #endif
 
+
+#if defined(DATA_A_TQ3_0)
+void quantize(uint dst_idx, uint src_idx)
+{
+    const float INV_SQRT32 = 0.17677669529663688;
+    const float CENTROIDS[4] = float[4](-1.510, -0.4528, 0.4528, 1.510);
+    const float SIGNS[32] = float[32](
+        1.0,-1.0, 1.0, 1.0,-1.0,-1.0, 1.0,-1.0,
+        1.0, 1.0,-1.0, 1.0,-1.0, 1.0,-1.0,-1.0,
+        1.0,-1.0,-1.0, 1.0, 1.0,-1.0, 1.0,-1.0,
+       -1.0, 1.0, 1.0, 1.0,-1.0,-1.0, 1.0,-1.0
+    );
+
+    float x[32];
+    [[unroll]] for (int j = 0; j < 32; j++) {
+        x[j] = data_s[src_idx + j] * SIGNS[j];
+    }
+
+    // Forward WHT (same butterfly as decode)
+    [[unroll]] for (int step = 1; step < 32; step <<= 1) {
+        [[unroll]] for (int i = 0; i < 32; i += step * 2) {
+            [[unroll]] for (int jj = i; jj < i + step; jj++) {
+                float a = x[jj], b = x[jj + step];
+                x[jj] = a + b; x[jj + step] = a - b;
+            }
+        }
+    }
+
+    // Scale to WHT-normalized domain (matches decode 1/sqrt(32) path)
+    [[unroll]] for (int j = 0; j < 32; j++) x[j] *= INV_SQRT32;
+
+    // Compute gamma (max-abs / max-centroid)
+    float amax = 0.0;
+    [[unroll]] for (int j = 0; j < 32; j++) amax = max(amax, abs(x[j]));
+    const float d = amax / 1.510;
+    const float id = (d != 0.0) ? 1.0 / d : 0.0;
+    data_q[dst_idx].gamma = float16_t(d);
+
+    // Nearest centroid search, pack 4x 2-bit per byte
+    [[unroll]] for (int b = 0; b < 8; b++) {
+        uint packed = 0;
+        [[unroll]] for (int k = 0; k < 4; k++) {
+            float v = x[b * 4 + k] * id;
+            int best = 0;
+            float best_d = abs(v - CENTROIDS[0]);
+            [[unroll]] for (int m = 1; m < 4; m++) {
+                float dd = abs(v - CENTROIDS[m]);
+                if (dd < best_d) { best_d = dd; best = m; }
+            }
+            packed |= uint(best) << (k * 2);
+        }
+        data_q[dst_idx].qs[b] = uint8_t(packed);
+    }
+    [[unroll]] for (int b = 0; b < 4; b++) data_q[dst_idx].qr[b] = uint8_t(0);
+}
+#endif
+
 #if defined(SET_ROWS)
 
 void main() {

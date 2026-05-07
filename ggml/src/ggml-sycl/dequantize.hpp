@@ -838,4 +838,118 @@ static void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restr
     }
 }
 
+
+
+// ============================================================
+// TurboQuant TQ3_0 dequantization for Intel SYCL backend
+// Port of the CPU reference in ggml-quants.c to SYCL
+//
+// TQ3_0 layout per 32-value block (14 bytes total):
+//   qs[8]  : 2-bit codebook indices (4 per byte)
+//   qr[4]  : QJL residual sign bits (8 per byte) — stored but unused in dequant
+//   gamma  : FP16 per-block scale
+//
+// Dequant: scale * centroid[2bit_idx] → inverse WHT-32
+// WHT is self-inverse: apply once forward, once inverse = identity × 32
+// ============================================================
+
+// Fixed random sign pattern (seed 42) — must match ggml-quants.c exactly
+static constexpr int8_t TQ3_SIGNS[32] = {
+    +1, -1, +1, +1, -1, -1, +1, -1, +1, +1, -1, +1, -1, +1, -1, -1,
+    +1, -1, -1, +1, +1, -1, +1, -1, -1, +1, +1, +1, -1, -1, +1, -1
+};
+
+// Max-Lloyd optimal centroids for N(0,1), 2-bit (4 levels)
+static constexpr float TQ3_CENTROIDS[4] = { -1.510f, -0.4528f, 0.4528f, 1.510f };
+
+static constexpr float TQ3_INV_SQRT32 = 0.17677669529663688f; // 1/sqrt(32)
+
+// Dequantize one TQ3_0 block, return elements [iqs] and [iqs+1].
+// iqs ranges 0, 2, 4, ..., 30 — same stride convention as Q8_0.
+// Decodes the full 32-element block each call (WHT mixes all values).
+// Per-call cost: 32 centroid lookups + 5-stage butterfly + 32 scale+sign ops.
+// Wasteful in theory, but all ops are register-only — no extra memory traffic.
+static __dpct_inline__ void dequantize_tq3_0(const void * vx, const int64_t ib,
+                                             const int iqs, dfloat2 & v) {
+    const block_tq3_0 * x = (const block_tq3_0 *) vx;
+
+    const float d = sycl::vec<sycl::half, 1>(x[ib].gamma)
+                        .convert<float, sycl::rounding_mode::automatic>()[0];
+
+    // Step 1: centroid lookup → rotated space
+    float rotated[32];
+#pragma unroll
+    for (int j = 0; j < 32; j++) {
+        const int idx = (x[ib].qs[j / 4] >> (2 * (j % 4))) & 3;
+        rotated[j] = d * TQ3_CENTROIDS[idx];
+    }
+
+    // Step 2: inverse Walsh-Hadamard Transform (5 butterfly stages)
+    // WHT is self-inverse: WHT(WHT(x)) = 32*x, so one application reverses it
+    // (the 1/sqrt(32) normalization handles the factor)
+#pragma unroll
+    for (int step = 1; step < 32; step <<= 1) {
+#pragma unroll
+        for (int i = 0; i < 32; i += step * 2) {
+#pragma unroll
+            for (int jj = i; jj < i + step; jj++) {
+                float a = rotated[jj];
+                float b = rotated[jj + step];
+                rotated[jj]        = a + b;
+                rotated[jj + step] = a - b;
+            }
+        }
+    }
+
+    // Step 3: normalize and undo preconditioning sign flips
+#pragma unroll
+    for (int j = 0; j < 32; j++) {
+        rotated[j] *= TQ3_INV_SQRT32 * (float)TQ3_SIGNS[j];
+    }
+
+    v.x() = rotated[iqs];
+    v.y() = rotated[iqs + 1];
+}
+
+// Full-block dequantize kernel for ggml_type_to_float / convert operations.
+// Each work-item handles one 32-value block → 32 output floats.
+template<typename dst_t>
+static void dequantize_block_tq3_0(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                   int64_t nb32, const sycl::nd_item<3> & item_ct1) {
+    const int64_t bid = (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2)
+                        + item_ct1.get_local_id(2);
+    if (bid >= nb32) return;
+
+    const block_tq3_0 * x = (const block_tq3_0 *) vx + bid;
+    dst_t * y = yy + bid * QK_TQ3_0;
+
+    const float d = sycl::vec<sycl::half, 1>(x->gamma)
+                        .convert<float, sycl::rounding_mode::automatic>()[0];
+
+    float rotated[32];
+#pragma unroll
+    for (int j = 0; j < 32; j++) {
+        const int idx = (x->qs[j / 4] >> (2 * (j % 4))) & 3;
+        rotated[j] = d * TQ3_CENTROIDS[idx];
+    }
+
+#pragma unroll
+    for (int step = 1; step < 32; step <<= 1) {
+#pragma unroll
+        for (int i = 0; i < 32; i += step * 2) {
+#pragma unroll
+            for (int jj = i; jj < i + step; jj++) {
+                float a = rotated[jj];
+                float b = rotated[jj + step];
+                rotated[jj]        = a + b;
+                rotated[jj + step] = a - b;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < 32; j++) {
+        y[j] = (dst_t)(rotated[j] * TQ3_INV_SQRT32 * (float)TQ3_SIGNS[j]);
+    }
+}
 #endif // GGML_SYCL_DEQUANTIZE_HPP

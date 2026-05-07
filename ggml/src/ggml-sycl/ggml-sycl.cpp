@@ -780,6 +780,7 @@ static int64_t get_row_rounding(ggml_type type, const std::array<float, GGML_SYC
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_TQ3_0:
             return 64;
         case GGML_TYPE_F16:
         case GGML_TYPE_F32:

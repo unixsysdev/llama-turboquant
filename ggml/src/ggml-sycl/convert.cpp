@@ -603,6 +603,8 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
             return dequantize_block_sycl<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
             return dequantize_block_sycl<QK8_0, QR8_0, dequantize_q8_0>;
+        case GGML_TYPE_TQ3_0:
+            return dequantize_block_sycl<QK_TQ3_0, QR_TQ3_0, dequantize_tq3_0>;
         case GGML_TYPE_Q2_K:
             return dequantize_row_q2_K_sycl;
         case GGML_TYPE_Q3_K:
@@ -669,6 +671,8 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
             return dequantize_block_sycl<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
             return dequantize_block_sycl<QK8_0, QR8_0, dequantize_q8_0>;
+        case GGML_TYPE_TQ3_0:
+            return dequantize_block_sycl<QK_TQ3_0, QR_TQ3_0, dequantize_tq3_0>;
         case GGML_TYPE_Q2_K:
             return dequantize_row_q2_K_sycl;
         case GGML_TYPE_Q3_K:
@@ -738,6 +742,8 @@ to_fp16_nc_sycl_t ggml_get_to_fp16_nc_sycl(ggml_type type) {
             return dequantize_block_nc_sycl<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
             return dequantize_block_nc_sycl<QK8_0, QR8_0, dequantize_q8_0>;
+        case GGML_TYPE_TQ3_0:
+            return dequantize_block_nc_sycl<QK_TQ3_0, QR_TQ3_0, dequantize_tq3_0>;
         default:
             return nullptr;
     }
