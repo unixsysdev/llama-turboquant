@@ -188,6 +188,32 @@ struct block_q8_0_packed16
 #define DATA_A_QUANT_LEGACY
 #endif
 
+#define QUANT_K_TQ3_0 32
+#define QUANT_R_TQ3_0 1
+
+// TurboQuant TQ3_0: 2-bit codebook + 1-bit QJL residual signs + FP16 scale
+struct block_tq3_0
+{
+    uint8_t  qs[8];   // 2-bit codebook indices, 4 per byte
+    uint8_t  qr[4];   // QJL residual sign bits (unused in dequant)
+    float16_t gamma;  // per-block scale
+};
+
+struct block_tq3_0_packed16
+{
+    uint16_t qs[4];   // 8 bytes: 2-bit indices packed 4 per original byte
+    uint16_t qr[2];   // 4 bytes: QJL residual bits (unused in dequant)
+    float16_t gamma;  // 2 bytes: per-block scale
+};
+
+#if defined(DATA_A_TQ3_0)
+#define QUANT_K QUANT_K_TQ3_0
+#define QUANT_R QUANT_R_TQ3_0
+#define QUANT_AUXF 1
+#define A_TYPE block_tq3_0
+#define A_TYPE_PACKED16 block_tq3_0_packed16
+#endif
+
 #define QUANT_K_Q8_1 32
 #define QUANT_R_Q8_1 1
 

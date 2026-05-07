@@ -602,3 +602,44 @@ vec2 get_dm(uint ib, uint a_offset) {
     return vec2(1, 0);
 }
 #endif
+
+#if defined(DATA_A_TQ3_0)
+// Decode full TQ3_0 block, return 4 elements at iqs
+// iqs called with 0, 4, 8, ..., 28 (by copy_from_quant) or 0, 1, ..., 30 (by mul_mat_vec)
+const float TQ3_FUNCS_CENTROIDS[4] = float[4](-1.510, -0.4528, 0.4528, 1.510);
+const float TQ3_FUNCS_SIGNS[32] = float[32](
+    1.0,-1.0, 1.0, 1.0,-1.0,-1.0, 1.0,-1.0, 1.0, 1.0,-1.0, 1.0,-1.0, 1.0,-1.0,-1.0,
+    1.0,-1.0,-1.0, 1.0, 1.0,-1.0, 1.0,-1.0,-1.0, 1.0, 1.0, 1.0,-1.0,-1.0, 1.0,-1.0
+);
+const float TQ3_FUNCS_INV_SQRT32 = 0.17677669529663688;
+float tq3_decode_all[32] = float[32](0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
+void tq3_decode(uint ib, uint a_offset) {
+    const float d = float(data_a[a_offset + ib].gamma);
+    [[unroll]] for (uint j = 0u; j < 32u; j++) {
+        uint idx = (uint(data_a[a_offset + ib].qs[j/4u]) >> ((j%4u)*2u)) & 3u;
+        tq3_decode_all[j] = d * TQ3_FUNCS_CENTROIDS[idx];
+    }
+    [[unroll]] for (uint step = 1u; step < 32u; step <<= 1u) {
+        [[unroll]] for (uint i = 0u; i < 32u; i += step * 2u) {
+            [[unroll]] for (uint jj = i; jj < i + step; jj++) {
+                float a = tq3_decode_all[jj], b = tq3_decode_all[jj+step];
+                tq3_decode_all[jj] = a+b; tq3_decode_all[jj+step] = a-b;
+            }
+        }
+    }
+    [[unroll]] for (uint j = 0u; j < 32u; j++)
+        tq3_decode_all[j] *= TQ3_FUNCS_INV_SQRT32 * TQ3_FUNCS_SIGNS[j];
+}
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    tq3_decode(ib, a_offset);
+    return vec2(tq3_decode_all[iqs], tq3_decode_all[iqs + 1u]);
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    tq3_decode(ib, a_offset);
+    return vec4(tq3_decode_all[iqs], tq3_decode_all[iqs+1u], tq3_decode_all[iqs+2u], tq3_decode_all[iqs+3u]);
+}
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(1.0, 0.0);  // values already fully decoded in dequantize/dequantize4
+}
+#endif
+

@@ -149,6 +149,55 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
 }
 #endif
 
+#if defined(DATA_A_TQ3_0)
+#define BLOCK_BYTE_SIZE 14
+
+const float TQ3_FA_CENTROIDS[4] = float[4](-1.510, -0.4528, 0.4528, 1.510);
+const float TQ3_FA_SIGNS[32] = float[32](
+    1.0,-1.0, 1.0, 1.0,-1.0,-1.0, 1.0,-1.0, 1.0, 1.0,-1.0, 1.0,-1.0, 1.0,-1.0,-1.0,
+    1.0,-1.0,-1.0, 1.0, 1.0,-1.0, 1.0,-1.0,-1.0, 1.0, 1.0, 1.0,-1.0,-1.0, 1.0,-1.0
+);
+const float TQ3_FA_INV_SQRT32 = 0.17677669529663688;
+
+FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    float vals[32];
+    // Extract 2-bit centroid indices from packed uint16 array.
+    // Original qs[8] bytes are packed as uint16_t qs[4]:
+    //   word = j/8, shift = ((j/4)&1)*8 + (j%4)*2
+    [[unroll]] for (uint j = 0u; j < 32u; j++) {
+        uint word  = j / 8u;
+        uint shift = ((j / 4u) & 1u) * 8u + (j % 4u) * 2u;
+        uint cidx;
+        if (binding_idx == BINDING_IDX_K) {
+            cidx = (uint(k_packed.k_data_packed16[a_offset + ib].qs[word]) >> shift) & 3u;
+        } else {
+            cidx = (uint(v_packed.v_data_packed16[a_offset + ib].qs[word]) >> shift) & 3u;
+        }
+        vals[j] = TQ3_FA_CENTROIDS[cidx];
+    }
+    // Scale by gamma
+    float gamma_val;
+    if (binding_idx == BINDING_IDX_K) {
+        gamma_val = float(k_packed.k_data_packed16[a_offset + ib].gamma);
+    } else {
+        gamma_val = float(v_packed.v_data_packed16[a_offset + ib].gamma);
+    }
+    [[unroll]] for (uint j = 0u; j < 32u; j++) vals[j] *= gamma_val;
+    // Inverse Walsh-Hadamard Transform (32-point butterfly)
+    [[unroll]] for (uint step = 1u; step < 32u; step <<= 1u) {
+        [[unroll]] for (uint ii = 0u; ii < 32u; ii += step * 2u) {
+            [[unroll]] for (uint jj = ii; jj < ii + step; jj++) {
+                float a = vals[jj], b = vals[jj + step];
+                vals[jj] = a + b; vals[jj + step] = a - b;
+            }
+        }
+    }
+    [[unroll]] for (uint j = 0u; j < 32u; j++)
+        vals[j] *= TQ3_FA_INV_SQRT32 * TQ3_FA_SIGNS[j];
+    return FLOAT_TYPEV4(vals[iqs], vals[iqs + 1u], vals[iqs + 2u], vals[iqs + 3u]);
+}
+#endif
+
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 
 

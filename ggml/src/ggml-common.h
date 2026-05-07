@@ -274,6 +274,7 @@ static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 
 //   - FP16 residual norm ||r||₂ for QJL scaling
 // Requires per-model rotation matrices Π and S (stored externally)
 #define QK_TQ3_0 32
+#define QR_TQ3_0 1  // iqs stride: 1 element per logical unit (full block decoded per call)
 typedef struct {
     uint8_t   qs[QK_TQ3_0 / 4]; // 2-bit codebook indices, 32 × 2 bits = 8 bytes
     uint8_t   qr[QK_TQ3_0 / 8]; // QJL residual signs, 32 × 1 bit = 4 bytes

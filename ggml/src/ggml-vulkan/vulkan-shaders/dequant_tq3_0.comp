@@ -1,0 +1,58 @@
+#version 450
+
+#include "dequant_head.glsl"
+
+// One thread per 32-value block.
+// block_tq3_0 is defined in types.glsl (included via dequant_head.glsl → types.glsl)
+// when DATA_A_TQ3_0 is defined by the build system.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A  { block_tq3_0 data_a[]; };
+layout (binding = 1) writeonly buffer D { D_TYPE data_b[]; };
+
+// Max-Lloyd optimal centroids for N(0,1), 2-bit (4 levels)
+const float TQ3_CENTROIDS[4] = float[4](-1.510, -0.4528, 0.4528, 1.510);
+
+// Fixed random sign pattern (seed 42) — must match ggml-quants.c exactly
+const float TQ3_SIGNS[32] = float[32](
+    1.0, -1.0,  1.0,  1.0, -1.0, -1.0,  1.0, -1.0,
+    1.0,  1.0, -1.0,  1.0, -1.0,  1.0, -1.0, -1.0,
+    1.0, -1.0, -1.0,  1.0,  1.0, -1.0,  1.0, -1.0,
+   -1.0,  1.0,  1.0,  1.0, -1.0, -1.0,  1.0, -1.0
+);
+
+const float INV_SQRT32 = 0.17677669529663688; // 1/sqrt(32)
+
+void main() {
+    const uint ib = gl_GlobalInvocationID.x;
+    if (ib >= p.nel / 32) return;
+
+    const float d = float(data_a[ib].gamma);
+
+    // Step 1: centroid lookup → rotated domain
+    float r[32];
+    [[unroll]] for (uint j = 0u; j < 32u; j++) {
+        uint byte_idx = j / 4u;
+        uint bit_off  = (j % 4u) * 2u;
+        uint idx = (uint(data_a[ib].qs[byte_idx]) >> bit_off) & 3u;
+        r[j] = d * TQ3_CENTROIDS[idx];
+    }
+
+    // Step 2: inverse Walsh-Hadamard Transform (5 butterfly stages)
+    [[unroll]] for (uint step = 1u; step < 32u; step <<= 1u) {
+        [[unroll]] for (uint i = 0u; i < 32u; i += step * 2u) {
+            [[unroll]] for (uint jj = i; jj < i + step; jj++) {
+                float a = r[jj];
+                float b = r[jj + step];
+                r[jj]        = a + b;
+                r[jj + step] = a - b;
+            }
+        }
+    }
+
+    // Step 3: normalize and undo preconditioning sign flips
+    const uint out_base = ib * 32u;
+    [[unroll]] for (uint j = 0u; j < 32u; j++) {
+        data_b[out_base + j] = D_TYPE(r[j] * INV_SQRT32 * TQ3_SIGNS[j]);
+    }
+}
