@@ -1,4 +1,62 @@
-# llama.cpp
+# llama.cpp — DualDeadline branch
+
+[![Paper on ResearchGate](https://img.shields.io/badge/paper-ResearchGate-00CCBB)](https://www.researchgate.net/publication/411009097_DualDeadline_Component-Staged_Expert_Prefetching_for_Exact_Offloaded_Mixture-of-Experts_Inference)
+
+> [!NOTE]
+> **Looking for TurboQuant?** The 3-bit KV-cache quantization work this
+> repository is named after lives on the [`main` branch](../../tree/main).
+> This branch (`llama-dualdeadline`) is an independent research prototype.
+
+This branch implements **DualDeadline** — component-staged expert streaming
+for offloaded mixture-of-experts inference, after the paper
+[*DualDeadline: Component-Staged Expert Prefetching for Exact Offloaded
+Mixture-of-Experts Inference*](https://www.researchgate.net/publication/411009097_DualDeadline_Component-Staged_Expert_Prefetching_for_Exact_Offloaded_Mixture-of-Experts_Inference)
+(Marcel Butucea, 2026; [study artifacts](https://github.com/unixsysdev/dualdeadline)).
+
+A gated MoE expert has **two transfer deadlines, not one**: gate/up
+projections are needed when expert compute starts, but the down projection is
+not consumed until gate/up arithmetic finishes. When expert tensors are kept
+in pinned host RAM (`--cpu-moe --no-mmap`), this branch lets the GPU claim the
+batch-1 expert matmuls by copying only the router-selected experts' slices
+into a persistent per-tensor LRU cache — gate/up slices first, down slices
+overlapping gate/up compute on a dedicated copy stream. Routing and outputs
+are exact; there is no prediction and no approximation.
+
+```sh
+GGML_CUDA_DUAL_DEADLINE=1 \
+llama-cli -m model.gguf -ngl 999 --cpu-moe --no-mmap -p "..."
+```
+
+Measured on Qwen3.6-35B-A3B (Q4_K_XL, 256 experts/layer, top-8) with all
+expert tensors in host memory, AMD Ryzen AI MAX+ 395 / Radeon 8060S
+(Strix Halo, unified memory), ROCm 7.2.4, `llama-bench -r 3`, tg64:
+
+| configuration | tg64 t/s |
+|---|---:|
+| upstream: expert matmuls on CPU (16 threads) | 49.7 ± 0.3 |
+| **DualDeadline staged**, cache 64 experts/tensor (84% hit rate) | **44.1 ± 0.4** |
+| DualDeadline **monolithic**, cache 64 (same copies, single deadline) | 42.7 ± 0.4 |
+| DualDeadline staged, cache 32 | 41.6 ± 0.4 |
+| DualDeadline monolithic, cache 32 | 39.6 ± 0.4 |
+
+Two honest readings. First, **staged beats monolithic by 3–5% end-to-end** at
+identical bytes, cache, and kernels — that is the paper's two-deadline claim
+reproduced inside a real decode loop rather than a microbenchmark. Second, on
+*this* unified-memory APU the CPU baseline still wins: there is no PCIe link
+to hide transfers behind, so explicit staging competes with zero-cost DRAM
+reads. The regime this mechanism targets is a PCIe-attached discrete GPU
+whose VRAM cannot hold the experts — where the alternative to staging is CPU
+compute or full-tensor streaming — and that measurement is still to be done.
+A validation mode (`GGML_CUDA_DD_VALIDATE=1`) recomputes every intercepted
+matmul via the standard path: **3,120 ops checked, max abs err 0.0** —
+bitwise identical.
+
+See [docs/dual-deadline.md](docs/dual-deadline.md) for the design, all
+environment variables, limitations, and how this relates to upstream's
+used-expert streaming. Implementation:
+[`ggml/src/ggml-cuda/dual-deadline.cu`](ggml/src/ggml-cuda/dual-deadline.cu).
+
+---
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 

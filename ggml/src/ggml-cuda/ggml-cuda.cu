@@ -18,6 +18,7 @@
 #include "ggml-cuda/conv2d-dw.cuh"
 #include "ggml-cuda/conv2d-transpose.cuh"
 #include "ggml-cuda/convert.cuh"
+#include "ggml-cuda/dual-deadline.cuh"
 #include "ggml-cuda/count-equal.cuh"
 #include "ggml-cuda/cpy.cuh"
 #include "ggml-cuda/cross-entropy-loss.cuh"
@@ -1681,6 +1682,11 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
 
     GGML_ASSERT(ffn_up && ffn_gate && glu);
 
+    // dual-deadline expert streaming intercepts individual MUL_MAT_ID nodes
+    if (ggml_cuda_dd_should_handle(ffn_up) || ggml_cuda_dd_should_handle(ffn_gate)) {
+        return false;
+    }
+
     if (!is_mul_mat && !is_mul_mat_id) {
         return false;
     }
@@ -1865,7 +1871,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
-static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
@@ -2215,7 +2221,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
             break;
         case GGML_OP_MUL_MAT_ID:
-            ggml_cuda_mul_mat_id(ctx, dst);
+            if (!ggml_cuda_dd_should_handle(dst) || !ggml_cuda_dd_mul_mat_id(ctx, dst)) {
+                ggml_cuda_mul_mat_id(ctx, dst);
+            }
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -2942,6 +2950,12 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     const size_t num_unary = std::count(ops.begin(), ops.end(), GGML_OP_UNARY);
     GGML_ASSERT(unary_ops.size() == num_unary);
 #endif
+
+    // nodes handled by the dual-deadline expert streaming path must be
+    // executed individually so that each MUL_MAT_ID can be intercepted
+    if (ggml_cuda_dd_should_handle(cgraph->nodes[node_idx])) {
+        return false;
+    }
 
     const auto is_equal = [](const std::initializer_list<enum ggml_op> & list1,
                              const std::initializer_list<enum ggml_op> & list2) {
@@ -4038,7 +4052,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
                         assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
-                               (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
+                               ((integrated || ggml_cuda_dd_enabled()) && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
                     }
                 }
 #else
@@ -4120,7 +4134,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
 
+    // dual-deadline expert streaming synchronizes the stream to read the
+    // routed expert ids, which is incompatible with CUDA graph capture
+    const bool dual_deadline = ggml_cuda_dd_enabled();
+    if (dual_deadline) {
+        ggml_cuda_dd_prescan(*cuda_ctx, cgraph);
+    }
+
 #ifdef USE_CUDA_GRAPH
+    if (!dual_deadline) {
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
@@ -4153,6 +4175,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
         }
     }
+    } // !dual_deadline
 #endif // USE_CUDA_GRAPH
 
     if (use_cuda_graph && cuda_graph_update_required) {
@@ -5179,7 +5202,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
-    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
+    // with dual-deadline expert streaming, host-resident (pinned) weights are
+    // used in place: MUL_MAT_ID copies only the routed expert slices on demand
+    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) ||
+           ((integrated || ggml_cuda_dd_enabled()) && ggml_backend_buft_is_cuda_host(buft));
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
